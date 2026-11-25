@@ -15,11 +15,12 @@ import streamlit as st
 import streamlit.components.v2 as components_v2
 from docx import Document
 from docx.opc.exceptions import PackageNotFoundError
-from openai import APIError, OpenAI, RateLimitError
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+from openai import APIError, RateLimitError
 from pypdf import PdfReader
 from pypdf.errors import FileNotDecryptedError, PdfReadError
 from streamlit.errors import StreamlitSecretNotFoundError
-from streamlit.components.v1 import html as component_html
 
 
 LOGGER = logging.getLogger(__name__)
@@ -81,7 +82,7 @@ tab_visibility_component = components_v2.component(
 )
 
 
-def get_groq_client() -> OpenAI:
+def get_groq_api_key() -> str:
     try:
         api_key = (
             os.getenv("GROQ_API_KEY", "")
@@ -93,7 +94,7 @@ def get_groq_client() -> OpenAI:
         raise RuntimeError(
             "Set GROQ_API_KEY in Streamlit Community Cloud secrets or in your local environment."
         )
-    return OpenAI(base_url="https://api.groq.com/openai/v1", api_key=api_key)
+    return api_key
 
 
 def extract_resume_text(filename: str, data: bytes) -> str:
@@ -147,27 +148,25 @@ def extract_resume_text(filename: str, data: bytes) -> str:
 
 
 def request_json(system_prompt: str, payload: dict[str, Any]) -> dict[str, Any]:
-    client = get_groq_client()
+    llm = ChatOpenAI(
+        model=DEFAULT_MODEL,
+        base_url="https://api.groq.com/openai/v1",
+        api_key=get_groq_api_key(),
+        temperature=0.2,
+        model_kwargs={"response_format": {"type": "json_object"}},
+    )
     try:
-        response = client.chat.completions.create(
-            model=DEFAULT_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": json.dumps(payload, ensure_ascii=False),
-                },
-            ],
-            temperature=0.2,
-            response_format={"type": "json_object"},
-        )
+        response = llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
+        ])
     except RateLimitError as error:
         raise RuntimeError("The AI service is rate limited. Please try again later.") from error
     except APIError as error:
         LOGGER.exception("Groq interview request failed.")
         raise RuntimeError(f"The AI service could not complete the request: {error}") from error
 
-    content = response.choices[0].message.content or ""
+    content = response.content if isinstance(response.content, str) else ""
     try:
         result = json.loads(content)
     except json.JSONDecodeError as error:
@@ -353,47 +352,6 @@ def evaluate_answers(
         ),
         "results": results,
     }
-
-
-def transcribe_english_audio(audio_file: Any) -> str:
-    client = get_groq_client()
-    filename = audio_file.name or "answer.webm"
-    content_type = audio_file.type or "audio/webm"
-    try:
-        result = client.audio.transcriptions.create(
-            model="whisper-large-v3",
-            file=(filename, io.BytesIO(audio_file.getvalue()), content_type),
-            response_format="verbose_json",
-        )
-    except RateLimitError as error:
-        raise RuntimeError("Speech recognition is rate limited. Please try again later.") from error
-    except APIError as error:
-        LOGGER.exception("Groq speech recognition failed.")
-        raise RuntimeError(f"Could not transcribe the recording: {error}") from error
-    if getattr(result, "language", "").casefold() not in {"english", "en"}:
-        raise RuntimeError("Speech input must be in English. Please record your answer again.")
-    transcript = (result.text or "").strip()
-    if not transcript:
-        raise RuntimeError("No speech was recognized. Please record your answer again.")
-    return transcript
-
-
-def speak_question(text: str, question_index: int) -> None:
-    encoded_text = json.dumps(text)
-    component_html(
-        f"""
-        <script>
-        const text = {encoded_text};
-        const utterance = new SpeechSynthesisUtterance(text);
-        utterance.lang = "en-US";
-        window.speechSynthesis.cancel();
-        window.speechSynthesis.speak(utterance);
-        </script>
-        """,
-        height=0,
-        width=0,
-        key=f"speech-{st.session_state.interview_id}-{question_index}",
-    )
 
 
 def init_state() -> None:
@@ -757,8 +715,6 @@ def render_interview() -> None:
                 unsafe_allow_html=True,
             )
             st.markdown(f"#### {question['question']}")
-            if st.button("🔊 Read question aloud", key=f"read-{st.session_state.interview_id}-{index}"):
-                speak_question(question["question"], index)
             if st.session_state.answers[index]["saved"]:
                 st.success(
                     f"Answer saved · {st.session_state.answers[index]['duration_seconds']:.1f} seconds"
@@ -766,33 +722,13 @@ def render_interview() -> None:
                 st.write(st.session_state.answers[index]["answer"])
                 continue
 
-            audio_file = st.audio_input(
-                "Record your answer in English (optional)",
-                key=f"audio-{st.session_state.interview_id}-{index}",
-            )
-            if audio_file and st.button(
-                "Transcribe English recording",
-                key=f"transcribe-{st.session_state.interview_id}-{index}",
-            ):
-                try:
-                    transcript = transcribe_english_audio(audio_file)
-                    answer_key = f"answer-{st.session_state.interview_id}-{index}"
-                    existing = st.session_state.get(answer_key, "").strip()
-                    st.session_state[answer_key] = " ".join(
-                        part for part in (existing, transcript) if part
-                    )
-                    st.success("English speech transcribed into your answer.")
-                    st.rerun()
-                except RuntimeError as error:
-                    st.error(str(error))
-
             answer_key = f"answer-{st.session_state.interview_id}-{index}"
             answer_text = st.text_area(
                 "Your answer",
                 key=answer_key,
                 height=130,
                 max_chars=8000,
-                placeholder="Type your technical answer, or record it above…",
+                placeholder="Type your technical answer…",
             )
             if answer_text.strip() and st.session_state.answers[index]["started_at"] is None:
                 st.session_state.answers[index]["started_at"] = time.monotonic()
